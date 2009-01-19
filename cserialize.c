@@ -39,12 +39,14 @@ static int do_serialize(PyObject *element, char *buf, int pos, int len)
 {
     PyObject *o;
     char *name, *s;
-    int size, total, namesize, i;
+    int size, total, namesize, i, ret;
     PyObject *elemname, *attrs, *key, *value, *children, *child;
     Py_ssize_t dictpos = 0;
     int namedecref = 0;
     int decref = 0;
     int decref2 = 0;
+
+    ret = 0;
 
     /* handle content */
     if (PyString_Check(element) || PyUnicode_Check(element)) {
@@ -69,14 +71,17 @@ static int do_serialize(PyObject *element, char *buf, int pos, int len)
     }
 
     /* handle elements */
-    if (!PyObject_HasAttrString(element, "name"))
+    if (!PyObject_HasAttrString(element, "name")) {
+        ret = -1;
         goto error;
+    }
 
     elemname = PyObject_GetAttrString(element, "name");
     if (PyUnicode_Check(elemname)) {
         elemname = PyUnicode_AsUTF8String(elemname);
         namedecref = 1;
     } else if (!PyString_Check(elemname)) {
+        ret = -1;
         goto error;
     }
     
@@ -91,19 +96,27 @@ static int do_serialize(PyObject *element, char *buf, int pos, int len)
     pos += namesize;
 
     /* attributes */
-    if (!PyObject_HasAttrString(element, "attributes"))
+    if (!PyObject_HasAttrString(element, "attributes")) {
+        ret = -1;
         goto error;
+    }
 
     attrs = PyObject_GetAttrString(element, "attributes");
-    if (!PyDict_Check(attrs))
+    if (!PyDict_Check(attrs)) {
+        ret = -1;
         goto error;
+    }
 
     while (PyDict_Next(attrs, &dictpos, &key, &value)) {
-        if (!PyString_Check(key) && !PyUnicode_Check(key))
+        if (!PyString_Check(key) && !PyUnicode_Check(key)) {
+            ret = -1;
             goto error;
+        }
 
-        if (!PyString_Check(value) && !PyUnicode_Check(value))
+        if (!PyString_Check(value) && !PyUnicode_Check(value)) {
+            ret = -1;
             goto error;
+        }
         
         if (PyUnicode_Check(key)) {
             key = PyUnicode_AsUTF8String(key);
@@ -143,12 +156,16 @@ static int do_serialize(PyObject *element, char *buf, int pos, int len)
     }
 
     /* children */
-    if (!PyObject_HasAttrString(element, "children"))
+    if (!PyObject_HasAttrString(element, "children")) {
+        ret = -1;
         goto error;
+    }
 
     children = PyObject_GetAttrString(element, "children");
-    if (!PyList_Check(children))
+    if (!PyList_Check(children)) {
+        ret = -1;
         goto error;
+    }
 
     size = PyList_Size(children);
     if (size > 0) {
@@ -186,7 +203,7 @@ error:
         namedecref = 0;
     }
 
-    return 0;
+    return ret;
 }
 
 
@@ -196,21 +213,44 @@ PyDoc_STRVAR(serialize__doc__,
 static PyObject *serialize(PyObject *self, PyObject *args)
 {
     int ok, size;
-    PyObject *element;
-    char buf[4096];
+    PyObject *element, *result;
+    char buf[4096], *dynbuf;
     int len = 4096;
 
     ok = PyArg_ParseTuple(args, "O", &element);
-    if (!ok) 
-        Py_RETURN_NONE;
-
-    size = do_serialize(element, buf, 0, len);
-    if (!size) {
-        Py_RETURN_NONE;
+    if (!ok) {
+        PyErr_SetString(PyExc_TypeError,
+                        "serialize() takes exactly one argument");
+        return NULL;
     }
 
-    buf[size] = 0;
-    return PyUnicode_DecodeUTF8(buf, size, NULL);
+    dynbuf = NULL;
+    size = do_serialize(element, buf, 0, len);
+    while (size == 0) {
+        if (dynbuf)
+            free(dynbuf);
+        len *= 2;
+        dynbuf = (char *)malloc(len);
+        if (!dynbuf)
+            Py_RETURN_NONE;
+        size = do_serialize(element, dynbuf, 0, len);
+    }
+
+    if (size < 0) {
+        PyErr_SetString(PyExc_TypeError, "Incorrect object in element tree.");
+        return NULL;
+    }
+
+    if (dynbuf) {
+        dynbuf[size] = 0;
+        result = PyUnicode_DecodeUTF8(dynbuf, size, NULL);
+        free(dynbuf);
+    } else {
+        buf[size] = 0;
+        result = PyUnicode_DecodeUTF8(buf, size, NULL);
+    }
+
+    return result;
 }
 
 static PyMethodDef cserialize_methods[] = {

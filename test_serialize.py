@@ -57,3 +57,31 @@ class SerializeTestCase(unittest.TestCase):
         e = u"<encoded>&lt;asdf/&gt;</encoded>"
         s = serialize(elem)
         self.check(e, s)
+
+    def testLongResult(self):
+        elem = domish.Element((None, 'long'))
+        elem.addContent("&" * 4096)
+        e = u"<long>%s</long>" % ("&amp;" * 4096,)
+        s = serialize(elem)
+        self.check(e, s)
+
+    def testTooManyArgs(self):
+        failed = False
+        try:
+            serialize(1, 2, 3)
+        except TypeError:
+            failed = True
+        except Exception, e:
+            self.fail("Got bad exception: %s" % str(e))
+        self.failUnless(failed, "Didn't get expected failure.")
+
+    def testBadInput(self):
+        failed = False
+        try:
+            serialize([])
+        except TypeError:
+            failed = True
+        except Exception, e:
+            self.fail("Got bad exception: %s" % str(e))
+        self.failUnless(failed, "Didn't get expected failure.")
+            
