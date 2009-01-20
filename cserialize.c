@@ -1,5 +1,11 @@
 #include "Python.h"
 
+#if PY_VERSION_HEX < 0x02050000
+typedef int Py_ssize_t;
+#define PY_SSIZE_T_MAX INT_MAX
+#define PY_SSIZE_T_MIN INT_MIN
+#endif
+
 struct prefix_st {
     char *uri;
     char *prefix;
@@ -531,27 +537,109 @@ error:
     return ret;
 }
 
+static int convert_from_dict(PyObject *dict, prefix_t **list)
+{
+    PyObject *key, *value;
+    Py_ssize_t dpos;
+    prefix_t *item;
+    int kdecref = 0;
+    int vdecref = 0;
+    prefix_t *prefixes = NULL;
+
+    /* convert prefix dict to internal list structure */
+    if (dict) {
+        if (!PyDict_Check(dict)) {
+            PyErr_SetString(PyExc_TypeError,
+                            "prefixes kwarg must be a dictionary");
+            return -1;
+        }
+
+        while (PyDict_Next(dict, &dpos, &key, &value)) {
+            if (!PyString_Check(key) && !PyUnicode_Check(key)) {
+                PyErr_SetString(PyExc_TypeError,
+                                "prefixes must be strings");
+                return -1;
+            }
+
+            if (!PyString_Check(value) && !PyUnicode_Check(value)) {
+                PyErr_SetString(PyExc_TypeError,
+                                "prefixes must be strings");
+                return -1;
+            }
+        
+            if (PyUnicode_Check(key)) {
+                key = PyUnicode_AsUTF8String(key);
+                kdecref = 1;
+            }
+
+            if (PyUnicode_Check(value)) {
+                value = PyUnicode_AsUTF8String(value);
+                vdecref = 1;
+            }
+
+            item = prefix_new();
+            if (!item) {
+                if (kdecref) {
+                    Py_DECREF(key);
+                    kdecref = 0;
+                }
+                if (vdecref) {
+                    Py_DECREF(value);
+                    vdecref = 0;
+                }
+
+                PyErr_SetString(PyExc_RuntimeError, "out of memory");
+                return -1;
+            }
+
+            item->uri = strdup(PyString_AsString(key));
+            item->prefix = strdup(PyString_AsString(value));
+
+            if (prefixes)
+                prefix_append(prefixes, item);
+            else
+                prefixes = item;
+            
+            if (kdecref) {
+                Py_DECREF(key);
+                kdecref = 0;
+            }
+            if (vdecref) {
+                Py_DECREF(value);
+                vdecref = 0;
+            }
+        }
+    }
+
+    if (prefixes)
+        *list = prefixes;
+    return 0;
+}
 
 PyDoc_STRVAR(serialize__doc__,
              "Serialize a domish element.");
 
 static PyObject *serialize(PyObject *self, PyObject *args, PyObject *kwargs)
 {
-    int ok, size;
-    PyObject *element, *result, *key, *value;
+    int ok, size, i;
+    PyObject *element, *result, *value;
     char buf[4096], *dynbuf;
-    prefix_t *item;
+    prefix_t *found;
     int len = 4096;
     int closeElement = 1;
-    int kdecref = 0, vdecref = 0;
+    int decref = 0;
     PyObject *prefixdict = NULL;
+    PyObject *defaultUri = NULL;
+    PyObject *prefixesInScope = NULL;
     prefix_t *prefixes = NULL;
-    Py_ssize_t dpos = 0;
+    prefix_t *plist = NULL;
 
-    static char *kwlist[] = {"element", "prefixes", "closeElement", NULL};
+    static char *kwlist[] = {"element", "prefixes", "closeElement", 
+                             "defaultUri", "prefixesInScope", NULL};
 
-    ok = PyArg_ParseTupleAndKeywords(args, kwargs, "O|Oi", kwlist,
-                                     &element, &prefixdict, &closeElement);
+    ok = PyArg_ParseTupleAndKeywords(args, kwargs, "O|OiOO", kwlist,
+                                     &element, &prefixdict, &closeElement,
+                                     &defaultUri, &prefixesInScope);
     if (!ok) {
         PyErr_SetString(PyExc_TypeError,
                         "serialize() takes exactly one or two arguments");
@@ -569,65 +657,42 @@ static PyObject *serialize(PyObject *self, PyObject *args, PyObject *kwargs)
     prefixes->prefix = strdup("xml");
 
     /* convert prefix dict to internal list structure */
-    if (prefixdict) {
-        if (!PyDict_Check(prefixdict)) {
+    plist = NULL;
+    ok = convert_from_dict(prefixdict, &plist);
+    if (ok < 0) return NULL;
+    prefixes->next = plist;
+
+    if (prefixesInScope) {
+        if (prefixesInScope != Py_None && !PyList_Check(prefixesInScope)) {
             PyErr_SetString(PyExc_TypeError,
-                            "prefixes kwarg must be a dictionary");
+                            "Expected list or none for prefixesInScope.");
             return NULL;
         }
-
-        while (PyDict_Next(prefixdict, &dpos, &key, &value)) {
-            if (!PyString_Check(key) && !PyUnicode_Check(key)) {
-                PyErr_SetString(PyExc_TypeError,
-                                "prefixes must be strings");
-                return NULL;
-            }
-
-            if (!PyString_Check(value) && !PyUnicode_Check(value)) {
-                PyErr_SetString(PyExc_TypeError,
-                                "prefixes must be strings");
-                return NULL;
-            }
-        
-            if (PyUnicode_Check(key)) {
-                key = PyUnicode_AsUTF8String(key);
-                kdecref = 1;
-            }
-
-            if (PyUnicode_Check(value)) {
-                value = PyUnicode_AsUTF8String(value);
-                vdecref = 1;
-            }
-
-
-
-            item = prefix_new();
-            if (!item) {
-                if (kdecref) {
-                    Py_DECREF(key);
-                    kdecref = 0;
+        if (PyList_Check(prefixesInScope)) {
+            for (i = 0; i < PyList_GET_SIZE(prefixesInScope); i++) {
+                value = PyList_GET_ITEM(prefixesInScope, i);
+                if (!PyString_Check(value) && !PyUnicode_Check(value)) {
+                    PyErr_SetString(PyExc_TypeError,
+                                    "Expected strings in prefixesInScope.");
+                    return NULL;
                 }
-                if (vdecref) {
+
+                if (PyUnicode_Check(value)) {
+                    value = PyUnicode_AsUTF8String(value);
+                    decref = 1;
+                }
+
+                for (found = prefixes; found; found = found->next)
+                    if (strcmp(PyString_AsString(value), found->prefix) == 0)
+                        break;
+                
+                if (found)
+                    found->in_scope = 1;
+                
+                if (decref) {
                     Py_DECREF(value);
-                    vdecref = 0;
+                    decref = 0;
                 }
-
-                PyErr_SetString(PyExc_RuntimeError, "out of memory");
-                return NULL;
-            }
-
-            item->uri = strdup(PyString_AsString(key));
-            item->prefix = strdup(PyString_AsString(value));
-
-            prefix_append(prefixes, item);
-            
-            if (kdecref) {
-                Py_DECREF(key);
-                kdecref = 0;
-            }
-            if (vdecref) {
-                Py_DECREF(value);
-                vdecref = 0;
             }
         }
     }
