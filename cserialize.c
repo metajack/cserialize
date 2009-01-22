@@ -10,13 +10,12 @@ struct prefix_st {
     char *uri;
     char *prefix;
     int in_scope;
+    int stack_height;
     int needs_write;
     struct prefix_st *next;
 };
 
 typedef struct prefix_st prefix_t;
-
-static int prefix_counter = 0;
 
 static prefix_t *prefix_new(void)
 {
@@ -28,13 +27,14 @@ static prefix_t *prefix_new(void)
         list->prefix = NULL;
         list->in_scope = 0;
         list->needs_write = 0;
+        list->stack_height = 0;
         list->next = NULL;
     }
 
     return list;
 }
 
-static void prefix_free(prefix_t *list)
+static void prefix_free_list(prefix_t *list)
 {
     prefix_t *next;
 
@@ -49,13 +49,22 @@ static void prefix_free(prefix_t *list)
     }
 }
 
-static prefix_t *prefix_create(char *uri)
+static void prefix_free(prefix_t *prefix) 
+{
+    if (!prefix) return;
+
+    if (prefix->prefix) free(prefix->prefix);
+    if (prefix->uri) free(prefix->uri);
+    free(prefix);
+}
+
+static prefix_t *prefix_create(char *uri, int *counter)
 {
     prefix_t *item;
     char buf[128];
 
     item = prefix_new();
-    snprintf(buf, 127, "ns%d", prefix_counter++);
+    snprintf(buf, 127, "xn%d", (*counter)++);
     item->prefix = strdup(buf);
     item->uri = strdup(uri);
     return item;
@@ -67,7 +76,7 @@ static void prefix_append(prefix_t *list, prefix_t *item)
     list->next = item;
 }
 
-static prefix_t *prefix_find_uri(prefix_t **list, char *uri)
+static prefix_t *prefix_find_uri(prefix_t **list, char *uri, int *counter)
 {
     prefix_t *item;
     prefix_t *curr = *list;
@@ -78,7 +87,7 @@ static prefix_t *prefix_find_uri(prefix_t **list, char *uri)
         curr = curr->next;
     }
 
-    item = prefix_create(uri);
+    item = prefix_create(uri, counter);
     if (!item) return NULL;
 
     if (*list == NULL) {
@@ -125,24 +134,108 @@ static int encode(char *val, int size, char *buf, int pos, int len)
     return pos;
 }
 
+static int convert_from_dict(PyObject *dict, prefix_t **list)
+{
+    PyObject *key, *value;
+    prefix_t *item;
+    int kdecref = 0;
+    int vdecref = 0;
+    prefix_t *prefixes = NULL;
+    Py_ssize_t dpos = 0;
+
+    /* convert prefix dict to internal list structure */
+    if (dict) {
+        if (dict != Py_None && !PyDict_Check(dict)) {
+            PyErr_SetString(PyExc_TypeError,
+                            "expected a dictionary");
+            return -1;
+        }
+
+        if (PyDict_Check(dict)) {
+            while (PyDict_Next(dict, &dpos, &key, &value)) {
+                if (!PyString_Check(key) && !PyUnicode_Check(key)) {
+                    PyErr_SetString(PyExc_TypeError,
+                                    "prefixes must be strings");
+                    return -1;
+                }
+                
+                if (!PyString_Check(value) && !PyUnicode_Check(value)) {
+                    PyErr_SetString(PyExc_TypeError,
+                                    "prefixes must be strings");
+                    return -1;
+                }
+                
+                if (PyUnicode_Check(key)) {
+                    key = PyUnicode_AsUTF8String(key);
+                    kdecref = 1;
+                }
+                
+                if (PyUnicode_Check(value)) {
+                    value = PyUnicode_AsUTF8String(value);
+                    vdecref = 1;
+                }
+                
+                item = prefix_new();
+                if (!item) {
+                    if (kdecref) {
+                        Py_DECREF(key);
+                        kdecref = 0;
+                    }
+                    if (vdecref) {
+                        Py_DECREF(value);
+                        vdecref = 0;
+                    }
+                    
+                    PyErr_SetString(PyExc_RuntimeError, "out of memory");
+                    return -1;
+                }
+
+                item->uri = strdup(PyString_AS_STRING(key));
+                item->prefix = strdup(PyString_AS_STRING(value));
+                
+                if (prefixes)
+                    prefix_append(prefixes, item);
+                else
+                    prefixes = item;
+                
+                if (kdecref) {
+                    Py_DECREF(key);
+                    kdecref = 0;
+                }
+                if (vdecref) {
+                    Py_DECREF(value);
+                    vdecref = 0;
+                }
+            }
+        }
+    }
+
+    *list = prefixes;
+    return 0;
+}
+
 static int do_serialize(PyObject *element,
-                        char *defaultNS, prefix_t *prefixes, int closeElement,
+                        char *defaultNS, prefix_t *prefixes,
+                        int closeElement, int *prefixCounter,
                         char *buf, int pos, int len)
 {
     PyObject *o;
-    char *name, *s, *uri_s;
-    int size, total, namesize, i, ret, keysize, prefixsize, valsize;
-    PyObject *elemname, *attrs, *key, *value, *children, *child, *uri;
-    PyObject *keyns, *keyname;
+    char *name, *s;
+    int size, total, namesize, i, ret, keysize, prefixsize, valsize, ok;
+    PyObject *elemname, *attrs, *key, *value, *children, *child, *uri, *defUri;
+    PyObject *keyns, *keyname, *localPrefs;
+    prefix_t *lprefixes, *found, *next;
     Py_ssize_t dictpos = 0;
-    int namedecref = 0, uridecref = 0, uri2decref = 0;
+    int namedecref = 0, defuridecref = 0, uridecref = 0;
     int decref = 0;
     int decref2 = 0;
     int decref3 = 0;
-    int writeDefaultNS = 0;
+    int uri_size = 0, defUri_size = 0;
     prefix_t *prefix = NULL;
     prefix_t *nameprefix = NULL;
     prefix_t *attrprefix = NULL;
+    char *defUri_s = NULL;
+    char *uri_s = NULL;
 
     ret = 0;
     uri = NULL;
@@ -156,8 +249,8 @@ static int do_serialize(PyObject *element,
         } else
             o = element;
 
-        s = PyString_AsString(o);
-        size = PyString_Size(o);
+        s = PyString_AS_STRING(o);
+        size = PyString_GET_SIZE(o);
         pos = encode(s, size, buf, pos, len);
         if (!pos)
             goto error;
@@ -180,28 +273,56 @@ static int do_serialize(PyObject *element,
         goto error;
     }
 
-    uri = PyObject_GetAttrString(element, "defaultUri");
-    if (uri != Py_None && !PyString_Check(uri) && !PyUnicode_Check(uri)) {
+    defUri = PyObject_GetAttrString(element, "defaultUri");
+    if (defUri != Py_None && !PyString_Check(defUri) &&
+        !PyUnicode_Check(defUri)) {
         ret = -1;
         goto error;
     }
 
-    if (PyString_Check(uri) || PyUnicode_Check(uri)) {
-        if (PyUnicode_Check(uri)) {
-            uri = PyUnicode_AsUTF8String(uri);
-            uridecref = 1;
+    if (PyString_Check(defUri) || PyUnicode_Check(defUri)) {
+        if (PyUnicode_Check(defUri)) {
+            defUri = PyUnicode_AsUTF8String(defUri);
+            defuridecref = 1;
         }
 
-        uri_s = PyString_AsString(uri);
-        size = PyString_Size(uri);
-
-        if (!defaultNS || strcmp(defaultNS, uri_s) != 0) {
-            defaultNS = uri_s;
-            writeDefaultNS = size;
-        }
+        defUri_s = PyString_AS_STRING(defUri);
+        defUri_size = PyString_GET_SIZE(defUri);
+    } else {
+        defUri_s = defaultNS;
+        if (defUri_s)
+            defUri_size = strlen(defUri_s);
     }
 
     /* prefixes */
+
+    /* handle localPrefixes */
+    if (PyObject_HasAttrString(element, "localPrefixes")) {
+        localPrefs = PyObject_GetAttrString(element, "localPrefixes");
+        ok = convert_from_dict(localPrefs, &lprefixes);
+        if (ok < 0) {
+            ret = -1;
+            goto error;
+        }
+
+        prefix = lprefixes;
+        while (prefix) {
+            next = prefix->next;
+            for (found = prefixes; found; found = found->next) {
+                if (strcmp(found->prefix, prefix->prefix) == 0)
+                    break;
+            }
+
+            if (!found) {
+                prefix_append(prefixes, prefix);
+            } else {
+                prefix_free(prefix);
+            }
+
+            prefix = next;
+        }
+    }
+
     if (!PyObject_HasAttrString(element, "uri")) {
         ret = -1;
         goto error;
@@ -216,23 +337,35 @@ static int do_serialize(PyObject *element,
     if (PyString_Check(uri) || PyUnicode_Check(uri)) {
         if (PyUnicode_Check(uri)) {
             uri = PyUnicode_AsUTF8String(uri);
-            uri2decref = 1;
+            uridecref = 1;
         }
         
-        uri_s = PyString_AsString(uri);
-        if (strcmp(uri_s, defaultNS) != 0) {
-            prefix = prefix_find_uri(&prefixes, uri_s);
+        uri_s = PyString_AS_STRING(uri);
+        uri_size = PyString_GET_SIZE(uri);
+
+        for (prefix = prefixes; prefix; prefix = prefix->next) {
+            if (strcmp(prefix->uri, uri_s) == 0)
+                break;
+        }
+
+        if (defUri_s && strcmp(uri_s, defUri_s) != 0) {
+            prefix = prefix_find_uri(&prefixes, uri_s, prefixCounter);
+            if (!prefix->in_scope) {
+                prefix->needs_write = 1;
+                prefix->in_scope = 1;
+            }
+            nameprefix = prefix;
+        } else if (prefix) {
             if (!prefix->in_scope) {
                 prefix->needs_write = 1;
                 prefix->in_scope = 1;
             }
             nameprefix = prefix;
         }
-
-        if (uri2decref) {
-            Py_DECREF(uri);
-            uri2decref = 0;
-        }
+    } else {
+        uri_s = defaultNS;
+        if (uri_s)
+            uri_size = strlen(defaultNS);
     }
 
     if (!PyObject_HasAttrString(element, "name")) {
@@ -249,8 +382,8 @@ static int do_serialize(PyObject *element,
         goto error;
     }
     
-    name = PyString_AsString(elemname);
-    namesize = PyString_Size(elemname);
+    name = PyString_AS_STRING(elemname);
+    namesize = PyString_GET_SIZE(elemname);
 
     if (nameprefix) {
         size = strlen(nameprefix->prefix);
@@ -271,6 +404,7 @@ static int do_serialize(PyObject *element,
         strcpy(&buf[pos], name);
         pos += namesize;
     }
+
     
     /* attributes */
     if (!PyObject_HasAttrString(element, "attributes")) {
@@ -284,6 +418,7 @@ static int do_serialize(PyObject *element,
         goto error;
     }
 
+    dictpos = 0;
     while (PyDict_Next(attrs, &dictpos, &key, &value)) {
         attrprefix = NULL;
 
@@ -334,7 +469,8 @@ static int do_serialize(PyObject *element,
             }
 
             key = keyname;
-            attrprefix = prefix_find_uri(&prefixes, PyString_AsString(keyns));
+            attrprefix = prefix_find_uri(&prefixes, PyString_AS_STRING(keyns),
+                                         prefixCounter);
             if (!attrprefix->in_scope) attrprefix->needs_write = 1;
 
             if (decref3) {
@@ -353,8 +489,8 @@ static int do_serialize(PyObject *element,
             }
         }
 
-        keysize = PyString_Size(key);
-        valsize = PyString_Size(value);
+        keysize = PyString_GET_SIZE(key);
+        valsize = PyString_GET_SIZE(value);
         if (!attrprefix) {
             total = keysize + valsize;
             if (total + 4 > (len - pos)) {
@@ -370,7 +506,7 @@ static int do_serialize(PyObject *element,
             }
 
             buf[pos++] = ' ';
-            strcpy(&buf[pos], PyString_AsString(key));
+            strcpy(&buf[pos], PyString_AS_STRING(key));
             pos += keysize;
         } else {
             prefixsize = strlen(attrprefix->prefix);
@@ -391,12 +527,12 @@ static int do_serialize(PyObject *element,
             strcpy(&buf[pos], attrprefix->prefix);
             pos += prefixsize;
             buf[pos++] = ':';
-            strcpy(&buf[pos], PyString_AsString(key));
+            strcpy(&buf[pos], PyString_AS_STRING(key));
             pos += keysize;
         }
         buf[pos++] = '=';
         buf[pos++] = '\'';
-        pos = encode(PyString_AsString(value), valsize, 
+        pos = encode(PyString_AS_STRING(value), valsize, 
                      buf, pos, len);
         if (!pos) {
             if (decref) {
@@ -423,19 +559,23 @@ static int do_serialize(PyObject *element,
         }
     }
 
+
     /* write out namespaces and prefixes */
-    if (writeDefaultNS) {
-        if ((writeDefaultNS + 9) > (len - pos))
+    if (((defaultNS && defUri_s && strcmp(defaultNS, defUri_s) != 0) ||
+         (!defaultNS && defUri_s)) &&
+        uri_s && (strcmp(uri_s, defUri_s) != 0 ||
+                  !nameprefix || !nameprefix->in_scope)) {
+        if ((defUri_size + 9) > (len - pos))
             goto error;
         strcpy(&buf[pos], " xmlns='");
         pos += 8;
-        strcpy(&buf[pos], defaultNS);
-        pos += writeDefaultNS;
+        strcpy(&buf[pos], defUri_s);
+        pos += defUri_size;
         buf[pos++] = '\'';
     }
 
     for (prefix = prefixes; prefix; prefix = prefix->next) {
-        if (prefix->needs_write && strcmp(prefix->prefix, "xml")) {
+        if (prefix->needs_write && strcmp(prefix->prefix, "xml") != 0) {
             prefix->needs_write = 0;
             prefix->in_scope = 1;
 
@@ -478,6 +618,10 @@ static int do_serialize(PyObject *element,
         goto error;
     }
 
+    /* push prefixes onto the stack */
+    for (prefix = prefixes; prefix; prefix = prefix->next)
+        prefix->stack_height++;
+
     size = PyList_Size(children);
     if (size > 0) {
         if (1 > (len - pos))
@@ -486,7 +630,8 @@ static int do_serialize(PyObject *element,
 
         for (i = 0; i < size; i++) {
             child = PyList_GET_ITEM(children, i);
-            pos = do_serialize(child, defaultNS, prefixes, closeElement,
+            pos = do_serialize(child, defUri_s, prefixes,
+                               closeElement, prefixCounter,
                                buf, pos, len);
             if (!pos)
                 goto error;
@@ -522,6 +667,13 @@ static int do_serialize(PyObject *element,
         buf[pos++] = '>';
     }
 
+    /* pop the prefix stack */
+    for (prefix = prefixes; prefix; prefix = prefix->next) {
+        prefix->stack_height--;
+        if (prefix->stack_height == 0)
+            prefix->in_scope = 0;
+    }
+
     return pos;
 
 error:
@@ -529,93 +681,16 @@ error:
         Py_DECREF(elemname);
         namedecref = 0;
     }
+    if (defuridecref) {
+        Py_DECREF(defUri);
+        defuridecref = 0;
+    }
     if (uridecref) {
         Py_DECREF(uri);
         uridecref = 0;
     }
 
     return ret;
-}
-
-static int convert_from_dict(PyObject *dict, prefix_t **list)
-{
-    PyObject *key, *value;
-    Py_ssize_t dpos;
-    prefix_t *item;
-    int kdecref = 0;
-    int vdecref = 0;
-    prefix_t *prefixes = NULL;
-
-    /* convert prefix dict to internal list structure */
-    if (dict) {
-        if (dict != Py_None && !PyDict_Check(dict)) {
-            PyErr_SetString(PyExc_TypeError,
-                            "prefixes kwarg must be a dictionary");
-            return -1;
-        }
-
-        if (PyDict_Check(dict)) {
-            while (PyDict_Next(dict, &dpos, &key, &value)) {
-                if (!PyString_Check(key) && !PyUnicode_Check(key)) {
-                    PyErr_SetString(PyExc_TypeError,
-                                    "prefixes must be strings");
-                    return -1;
-                }
-                
-                if (!PyString_Check(value) && !PyUnicode_Check(value)) {
-                    PyErr_SetString(PyExc_TypeError,
-                                    "prefixes must be strings");
-                    return -1;
-                }
-                
-                if (PyUnicode_Check(key)) {
-                    key = PyUnicode_AsUTF8String(key);
-                    kdecref = 1;
-                }
-                
-                if (PyUnicode_Check(value)) {
-                    value = PyUnicode_AsUTF8String(value);
-                    vdecref = 1;
-                }
-                
-                item = prefix_new();
-                if (!item) {
-                    if (kdecref) {
-                        Py_DECREF(key);
-                        kdecref = 0;
-                    }
-                    if (vdecref) {
-                        Py_DECREF(value);
-                        vdecref = 0;
-                    }
-                    
-                    PyErr_SetString(PyExc_RuntimeError, "out of memory");
-                    return -1;
-                }
-                
-                item->uri = strdup(PyString_AsString(key));
-                item->prefix = strdup(PyString_AsString(value));
-                
-                if (prefixes)
-                    prefix_append(prefixes, item);
-                else
-                    prefixes = item;
-                
-                if (kdecref) {
-                    Py_DECREF(key);
-                    kdecref = 0;
-                }
-                if (vdecref) {
-                    Py_DECREF(value);
-                    vdecref = 0;
-                }
-            }
-        }
-    }
-
-    if (prefixes)
-        *list = prefixes;
-    return 0;
 }
 
 PyDoc_STRVAR(serialize__doc__,
@@ -629,6 +704,7 @@ static PyObject *serialize(PyObject *self, PyObject *args, PyObject *kwargs)
     prefix_t *found;
     int len = 4096;
     int closeElement = 1;
+    int prefixCounter = 0;
     int decref = 0;
     PyObject *prefixdict = NULL;
     PyObject *defaultUri = NULL;
@@ -657,6 +733,7 @@ static PyObject *serialize(PyObject *self, PyObject *args, PyObject *kwargs)
 
     prefixes->uri = strdup("http://www.w3.org/XML/1998/namespace");
     prefixes->prefix = strdup("xml");
+    prefixes->stack_height = 1;
 
     /* convert prefix dict to internal list structure */
     plist = NULL;
@@ -668,6 +745,7 @@ static PyObject *serialize(PyObject *self, PyObject *args, PyObject *kwargs)
         if (prefixesInScope != Py_None && !PyList_Check(prefixesInScope)) {
             PyErr_SetString(PyExc_TypeError,
                             "Expected list or none for prefixesInScope.");
+            if (prefixes) prefix_free_list(prefixes);
             return NULL;
         }
         if (PyList_Check(prefixesInScope)) {
@@ -676,6 +754,7 @@ static PyObject *serialize(PyObject *self, PyObject *args, PyObject *kwargs)
                 if (!PyString_Check(value) && !PyUnicode_Check(value)) {
                     PyErr_SetString(PyExc_TypeError,
                                     "Expected strings in prefixesInScope.");
+                    if (prefixes) prefix_free_list(prefixes);
                     return NULL;
                 }
 
@@ -685,7 +764,7 @@ static PyObject *serialize(PyObject *self, PyObject *args, PyObject *kwargs)
                 }
 
                 for (found = prefixes; found; found = found->next)
-                    if (strcmp(PyString_AsString(value), found->prefix) == 0)
+                    if (strcmp(PyString_AS_STRING(value), found->prefix) == 0)
                         break;
                 
                 if (found)
@@ -700,21 +779,23 @@ static PyObject *serialize(PyObject *self, PyObject *args, PyObject *kwargs)
     }
 
     dynbuf = NULL;
-    size = do_serialize(element, NULL, prefixes, closeElement, buf, 0, len);
+    size = do_serialize(element, NULL, prefixes, closeElement, 
+                        &prefixCounter, buf, 0, len);
     while (size == 0) {
         if (dynbuf)
             free(dynbuf);
         len *= 2;
         dynbuf = (char *)malloc(len);
         if (!dynbuf) {
-            if (prefixes) prefix_free(prefixes);
+            if (prefixes) prefix_free_list(prefixes);
             Py_RETURN_NONE;
         }
-        size = do_serialize(element, NULL, prefixes, closeElement, 
+        size = do_serialize(element, NULL, prefixes, closeElement,
+                            &prefixCounter, 
                             dynbuf, 0, len);
     }
 
-    if (prefixes) prefix_free(prefixes);
+    if (prefixes) prefix_free_list(prefixes);
 
     if (size < 0) {
         PyErr_SetString(PyExc_TypeError, "Incorrect object in element tree.");

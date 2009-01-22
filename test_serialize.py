@@ -146,26 +146,23 @@ class SerializeTestCase(unittest.TestCase):
     def testChildInDefaultNamespace(self):
         elem = domish.Element(('ns1', 'parent'), 'ns2')
         elem.addElement(('ns2', 'child'))
-        e = [u"<prefix:parent xmlns:prefix='ns1' xmlns='ns2'><child/>"\
-                 "</prefix:parent>",
-             u"<prefix:parent xmlns='ns2' xmlns:prefix='ns1'><child/>"\
-                 "</prefix:parent>"]
+        e = u"<prefix:parent xmlns='ns2' xmlns:prefix='ns1'><child/>"\
+            "</prefix:parent>"
         s = serialize(elem, prefixes={'ns1': 'prefix'})
         self.check(e, s)
 
     def testQualifiedAttribute(self):
         elem = domish.Element((None, 'foo'))
         elem[('somens', 'bar')] = 'baz'
-        e = [u"<foo prefix:bar='baz' xmlns:prefix='somens'/>",
-             u"<foo xmlns:prefix='somens' prefix:bar='baz'/>"]
-        s = serialize(elem, prefixes={'somens': 'prefix'})
+        e = u"<foo xn0:bar='baz' xmlns:xn0='somens'/>"
+        s = serialize(elem)
         self.check(e, s)
 
     def testQualifiedAttributeDefaultNS(self):
         elem = domish.Element(('somens', 'foo'))
         elem[('somens', 'bar')] = 'baz'
-        e = u"<foo prefix:bar='baz' xmlns='somens' xmlns:prefix='somens'/>"
-        s = serialize(elem, prefixes={'somens': 'prefix'})
+        e = u"<foo xn0:bar='baz' xmlns='somens' xmlns:xn0='somens'/>"
+        s = serialize(elem)
         self.check(e, s)
         
     def testTwoChildren(self):
@@ -174,16 +171,22 @@ class SerializeTestCase(unittest.TestCase):
         child1.addElement(('ns2', 'quux'))
         child2 = elem.addElement(('ns3', 'baz'), 'ns4')
         child2.addElement(('ns1', 'quux'))
-        e = u"<foo><ns1:bar xmlns='ns2' xmlns:ns1='ns1'><quux/></ns1:bar>"\
-            "<ns3:baz xmlns='ns4' xmlns:ns3='ns3'><quux xmlns='ns1'/>"\
-            "</ns3:baz></foo>"
-        s = serialize(elem, prefixes={'ns1': 'ns1', 'ns2': 'ns2',
-                                      'ns3': 'ns3'})
+        e = u"<foo><xn0:bar xmlns='ns2' xmlns:xn0='ns1'><quux/></xn0:bar>"\
+            "<xn1:baz xmlns='ns4' xmlns:xn1='ns3'><xn0:quux xmlns:xn0='ns1'/>"\
+            "</xn1:baz></foo>"
+        s = serialize(elem)
         self.check(e, s)
 
     def testXMLNamespace(self):
         elem = domish.Element((None, 'foo'))
         elem[('http://www.w3.org/XML/1998/namespace', 'lang')] = 'en_US'
         e = u"<foo xml:lang='en_US'/>"
+        s = serialize(elem)
+        self.check(e, s)
+
+    def testLocalPrefixes(self):
+        elem = domish.Element(('somens', 'foo'),
+                              localPrefixes={'somens': 'bar'})
+        e = u"<bar:foo xmlns:bar='somens'/>"
         s = serialize(elem)
         self.check(e, s)
