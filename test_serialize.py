@@ -6,7 +6,7 @@ from cserialize import serialize
 def error(expected, got):
     if type(expected) == list:
         expected = u",".join(expected)
-    return "Got wrong serialization: %s (expected: %s)" % (got, expected)
+    return u"Got wrong serialization: %s (expected: %s)" % (got, expected)
 
 
 class SerializeTestCase(unittest.TestCase):
@@ -190,3 +190,27 @@ class SerializeTestCase(unittest.TestCase):
         e = u"<bar:foo xmlns:bar='somens'/>"
         s = serialize(elem)
         self.check(e, s)
+
+    def testLocalPrefixesWithChild(self):
+        elem = domish.Element(('somens', 'foo'),
+                              localPrefixes={'somens': 'bar'})
+        elem.addElement('baz')
+        e = u"<bar:foo xmlns:bar='somens'><baz/></bar:foo>"
+        s = serialize(elem)
+        self.check(e, s)
+
+    def testRawXMLSerialization(self):
+        elem = domish.Element((None, "foo"))
+        elem.addRawXml("<abc123>")
+        e = u"<foo><abc123></foo>"
+        s = serialize(elem)
+        self.check(e, s)
+
+    def testRawXMLWithUnicodeSerialization(self):
+        elem = domish.Element((None, 'foo'))
+        elem.addRawXml(u"<degree>\u0080</degree>")
+        e = u"<foo><degree>\u0080</degree></foo>"
+        s = serialize(elem)
+        self.check(e, s)
+        
+
