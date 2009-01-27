@@ -214,6 +214,23 @@ static int convert_from_dict(PyObject *dict, prefix_t **list)
     return 0;
 }
 
+/* return a normal utf8 string from a unicode or string python object.
+ * the original object may be destroyed, and the returned object must
+ * be derefed at some point.
+ */
+static PyObject *make_utf8_string(PyObject *s)
+{
+    PyObject *result;
+
+    if (PyUnicode_Check(s)) {
+        result = PyUnicode_AsUTF8String(s);
+        Py_DECREF(s);
+    } else {
+        result = s;
+    }
+    return result;
+}
+
 static int do_serialize(PyObject *element,
                         char *defaultNS, prefix_t *prefixes,
                         int closeElement, int *prefixCounter,
@@ -222,14 +239,11 @@ static int do_serialize(PyObject *element,
     PyObject *o;
     char *name, *s;
     int size, total, namesize, i, ret, keysize, prefixsize, valsize, ok;
-    PyObject *elemname, *attrs, *key, *value, *children, *child, *uri, *defUri;
-    PyObject *keyns, *keyname, *localPrefs;
+    PyObject *elemname, *attrs, *key, *value, *children, *child, *uri, *defUri,
+        *class, *clsname;
+    PyObject *keyns, *keyname, *keyval, *localPrefs;
     prefix_t *lprefixes, *found, *next;
     Py_ssize_t dictpos = 0;
-    int namedecref = 0, defuridecref = 0, uridecref = 0;
-    int decref = 0;
-    int decref2 = 0;
-    int decref3 = 0;
     int uri_size = 0, defUri_size = 0;
     prefix_t *prefix = NULL;
     prefix_t *nameprefix = NULL;
@@ -239,26 +253,38 @@ static int do_serialize(PyObject *element,
 
     ret = 0;
     uri = NULL;
+    attrs = NULL;
     elemname = NULL;
+    defUri = NULL;
+    uri = NULL;
+    children = NULL;
 
     /* handle content */
     if (PyString_Check(element) || PyUnicode_Check(element)) {
         if (PyUnicode_Check(element)) {
             o = PyUnicode_AsUTF8String(element);
-            decref = 1;
-        } else
+        } else {
             o = element;
+            Py_INCREF(o);
+        }
 
         s = PyString_AS_STRING(o);
         size = PyString_GET_SIZE(o);
-        pos = encode(s, size, buf, pos, len);
-        if (!pos)
-            goto error;
 
-        if (decref) {
-            Py_DECREF(o);
-            decref = 0;
+        class = PyObject_GetAttrString(element, "__class__");
+        clsname = PyObject_GetAttrString(class, "__name__");
+        if (strcmp("SerializedXML", PyString_AS_STRING(clsname)) == 0) {
+            strcpy(&buf[pos], s);
+            pos += size;
+        } else {
+            pos = encode(s, size, buf, pos, len);
         }
+        Py_DECREF(clsname);
+        Py_DECREF(class);
+
+        Py_DECREF(o);
+
+        if (!pos) goto error;
 
         return pos;
     }
@@ -281,11 +307,7 @@ static int do_serialize(PyObject *element,
     }
 
     if (PyString_Check(defUri) || PyUnicode_Check(defUri)) {
-        if (PyUnicode_Check(defUri)) {
-            defUri = PyUnicode_AsUTF8String(defUri);
-            defuridecref = 1;
-        }
-
+        defUri = make_utf8_string(defUri);
         defUri_s = PyString_AS_STRING(defUri);
         defUri_size = PyString_GET_SIZE(defUri);
     } else {
@@ -300,6 +322,8 @@ static int do_serialize(PyObject *element,
     if (PyObject_HasAttrString(element, "localPrefixes")) {
         localPrefs = PyObject_GetAttrString(element, "localPrefixes");
         ok = convert_from_dict(localPrefs, &lprefixes);
+        Py_DECREF(localPrefs);
+        localPrefs = NULL;
         if (ok < 0) {
             ret = -1;
             goto error;
@@ -335,11 +359,7 @@ static int do_serialize(PyObject *element,
     }
 
     if (PyString_Check(uri) || PyUnicode_Check(uri)) {
-        if (PyUnicode_Check(uri)) {
-            uri = PyUnicode_AsUTF8String(uri);
-            uridecref = 1;
-        }
-        
+        uri = make_utf8_string(uri);
         uri_s = PyString_AS_STRING(uri);
         uri_size = PyString_GET_SIZE(uri);
 
@@ -363,6 +383,9 @@ static int do_serialize(PyObject *element,
             nameprefix = prefix;
         }
     } else {
+        Py_DECREF(uri);
+        uri = NULL;
+
         uri_s = defaultNS;
         if (uri_s)
             uri_size = strlen(defaultNS);
@@ -374,10 +397,9 @@ static int do_serialize(PyObject *element,
     }
 
     elemname = PyObject_GetAttrString(element, "name");
-    if (PyUnicode_Check(elemname)) {
-        elemname = PyUnicode_AsUTF8String(elemname);
-        namedecref = 1;
-    } else if (!PyString_Check(elemname)) {
+    if (PyString_Check(elemname) || PyUnicode_Check(elemname)) {
+        elemname = make_utf8_string(elemname);
+    } else {
         ret = -1;
         goto error;
     }
@@ -421,6 +443,9 @@ static int do_serialize(PyObject *element,
     dictpos = 0;
     while (PyDict_Next(attrs, &dictpos, &key, &value)) {
         attrprefix = NULL;
+        keyname = NULL;
+        keyval = NULL;
+        keyns = NULL;
 
         if (!PyString_Check(key) && !PyUnicode_Check(key) &&
             !PyTuple_Check(key)) {
@@ -452,82 +477,57 @@ static int do_serialize(PyObject *element,
                 goto error;
             }
 
-            /* these decrefs have to match the other branch */
-            if (PyUnicode_Check(keyns)) {
-                keyns = PyUnicode_AsUTF8String(keyns);
-                decref3 = 1;
-            }
+            /* turn borrowed refs into new refs */
+            Py_INCREF(keyns);
+            Py_INCREF(keyname);
+            Py_INCREF(value);
+            keyns = make_utf8_string(keyns);
+            keyname = make_utf8_string(keyname);
+            value = make_utf8_string(value);
 
-            if (PyUnicode_Check(keyname)) {
-                keyname = PyUnicode_AsUTF8String(keyname);
-                decref = 1;
-            }
-
-            if (PyUnicode_Check(value)) {
-                value = PyUnicode_AsUTF8String(value);
-                decref2 = 1;
-            }
-
-            key = keyname;
             attrprefix = prefix_find_uri(&prefixes, PyString_AS_STRING(keyns),
                                          prefixCounter);
             if (!attrprefix->in_scope) attrprefix->needs_write = 1;
 
-            if (decref3) {
+            if (keyns) {
                 Py_DECREF(keyns);
-                decref3 = 0;
+                keyns = NULL;
             }
         } else {
-            if (PyUnicode_Check(key)) {
-                key = PyUnicode_AsUTF8String(key);
-                decref = 1;
-            }
-            
-            if (PyUnicode_Check(value)) {
-                value = PyUnicode_AsUTF8String(value);
-                decref2 = 1;
-            }
+            keyname = key;
+            /* turn borrowed refs into new refs */
+            Py_INCREF(keyname);
+            Py_INCREF(value);
+            keyname = make_utf8_string(keyname);
+            value = make_utf8_string(value);
         }
 
-        keysize = PyString_GET_SIZE(key);
+        keysize = PyString_GET_SIZE(keyname);
         valsize = PyString_GET_SIZE(value);
         if (!attrprefix) {
             total = keysize + valsize;
             if (total + 4 > (len - pos)) {
-                if (decref) {
-                    Py_DECREF(key);
-                    decref = 0;
-                }
-                if (decref2) {
-                    Py_DECREF(value);
-                    decref2 = 0;
-                }
+                if (keyname) { Py_DECREF(keyname); }
+                if (value) { Py_DECREF(value); }
                 goto error;
             }
 
             buf[pos++] = ' ';
-            strcpy(&buf[pos], PyString_AS_STRING(key));
+            strcpy(&buf[pos], PyString_AS_STRING(keyname));
             pos += keysize;
         } else {
             prefixsize = strlen(attrprefix->prefix);
             total = keysize + valsize + prefixsize;
             if ((total + 5) > (len - pos)) {
-                if (decref) {
-                    Py_DECREF(key);
-                    decref = 0;
-                }
-                if (decref2) {
-                    Py_DECREF(value);
-                    decref2 = 0;
-                }
-
+                if (keyname) { Py_DECREF(keyname); }
+                if (value) { Py_DECREF(value); }
                 goto error;
             }
             buf[pos++] = ' ';
             strcpy(&buf[pos], attrprefix->prefix);
             pos += prefixsize;
             buf[pos++] = ':';
-            strcpy(&buf[pos], PyString_AS_STRING(key));
+            strcpy(&buf[pos], PyString_AS_STRING(keyname));
             pos += keysize;
         }
         buf[pos++] = '=';
@@ -535,28 +535,14 @@ static int do_serialize(PyObject *element,
         pos = encode(PyString_AS_STRING(value), valsize, 
                      buf, pos, len);
         if (!pos) {
-            if (decref) {
-                Py_DECREF(key);
-                decref = 0;
-            }
-            if (decref2) {
-                Py_DECREF(value);
-                decref2 = 0;
-            }
-            
+            if (keyname) { Py_DECREF(keyname); }
+            if (value) { Py_DECREF(value); }
             goto error;
         }
         buf[pos++] = '\'';
 
-        if (decref) {
-            Py_DECREF(key);
-            decref = 0;
-        }
-
-        if (decref2) {
-            Py_DECREF(value);
-            decref2 = 0;
-        }
+        if (keyname) { Py_DECREF(keyname); }
+        if (value) { Py_DECREF(value); }
     }
 
 
@@ -622,7 +608,7 @@ static int do_serialize(PyObject *element,
     for (prefix = prefixes; prefix; prefix = prefix->next)
         prefix->stack_height++;
 
-    size = PyList_Size(children);
+    size = PyList_GET_SIZE(children);
     if (size > 0) {
         if (1 > (len - pos))
             goto error;
@@ -674,21 +660,15 @@ static int do_serialize(PyObject *element,
             prefix->in_scope = 0;
     }
 
-    return pos;
+    ret =  pos;
+    /* fall through */
 
 error:
-    if (namedecref) {
-        Py_DECREF(elemname);
-        namedecref = 0;
-    }
-    if (defuridecref) {
-        Py_DECREF(defUri);
-        defuridecref = 0;
-    }
-    if (uridecref) {
-        Py_DECREF(uri);
-        uridecref = 0;
-    }
+    if (children) { Py_DECREF(children); }
+    if (attrs) { Py_DECREF(attrs); }
+    if (elemname) { Py_DECREF(elemname); }
+    if (uri) { Py_DECREF(uri); }
+    if (defUri) { Py_DECREF(defUri); }
 
     return ret;
 }
