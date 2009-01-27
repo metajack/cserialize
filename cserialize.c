@@ -134,12 +134,27 @@ static int encode(char *val, int size, char *buf, int pos, int len)
     return pos;
 }
 
+/* return a normal utf8 string from a unicode or string python object.
+ * the original object may be destroyed, and the returned object must
+ * be derefed at some point.
+ */
+static PyObject *make_utf8_string(PyObject *s)
+{
+    PyObject *result;
+
+    if (PyUnicode_Check(s)) {
+        result = PyUnicode_AsUTF8String(s);
+        Py_DECREF(s);
+    } else {
+        result = s;
+    }
+    return result;
+}
+
 static int convert_from_dict(PyObject *dict, prefix_t **list)
 {
     PyObject *key, *value;
     prefix_t *item;
-    int kdecref = 0;
-    int vdecref = 0;
     prefix_t *prefixes = NULL;
     Py_ssize_t dpos = 0;
 
@@ -164,27 +179,17 @@ static int convert_from_dict(PyObject *dict, prefix_t **list)
                                     "prefixes must be strings");
                     return -1;
                 }
-                
-                if (PyUnicode_Check(key)) {
-                    key = PyUnicode_AsUTF8String(key);
-                    kdecref = 1;
-                }
-                
-                if (PyUnicode_Check(value)) {
-                    value = PyUnicode_AsUTF8String(value);
-                    vdecref = 1;
-                }
+               
+                Py_INCREF(key);
+                key = make_utf8_string(key);
+ 
+                Py_INCREF(value);
+                value = make_utf8_string(value);
                 
                 item = prefix_new();
                 if (!item) {
-                    if (kdecref) {
-                        Py_DECREF(key);
-                        kdecref = 0;
-                    }
-                    if (vdecref) {
-                        Py_DECREF(value);
-                        vdecref = 0;
-                    }
+                    Py_DECREF(key);
+                    Py_DECREF(value);
                     
                     PyErr_SetString(PyExc_RuntimeError, "out of memory");
                     return -1;
@@ -198,37 +203,14 @@ static int convert_from_dict(PyObject *dict, prefix_t **list)
                 else
                     prefixes = item;
                 
-                if (kdecref) {
-                    Py_DECREF(key);
-                    kdecref = 0;
-                }
-                if (vdecref) {
-                    Py_DECREF(value);
-                    vdecref = 0;
-                }
+                Py_DECREF(key);
+                Py_DECREF(value);
             }
         }
     }
 
     *list = prefixes;
     return 0;
-}
-
-/* return a normal utf8 string from a unicode or string python object.
- * the original object may be destroyed, and the returned object must
- * be derefed at some point.
- */
-static PyObject *make_utf8_string(PyObject *s)
-{
-    PyObject *result;
-
-    if (PyUnicode_Check(s)) {
-        result = PyUnicode_AsUTF8String(s);
-        Py_DECREF(s);
-    } else {
-        result = s;
-    }
-    return result;
 }
 
 static int do_serialize(PyObject *element,
@@ -685,7 +667,6 @@ static PyObject *serialize(PyObject *self, PyObject *args, PyObject *kwargs)
     int len = 4096;
     int closeElement = 1;
     int prefixCounter = 0;
-    int decref = 0;
     PyObject *prefixdict = NULL;
     PyObject *defaultUri = NULL;
     PyObject *prefixesInScope = NULL;
@@ -738,10 +719,8 @@ static PyObject *serialize(PyObject *self, PyObject *args, PyObject *kwargs)
                     return NULL;
                 }
 
-                if (PyUnicode_Check(value)) {
-                    value = PyUnicode_AsUTF8String(value);
-                    decref = 1;
-                }
+                Py_INCREF(value);
+                value = make_utf8_string(value);
 
                 for (found = prefixes; found; found = found->next)
                     if (strcmp(PyString_AS_STRING(value), found->prefix) == 0)
@@ -750,10 +729,7 @@ static PyObject *serialize(PyObject *self, PyObject *args, PyObject *kwargs)
                 if (found)
                     found->in_scope = 1;
                 
-                if (decref) {
-                    Py_DECREF(value);
-                    decref = 0;
-                }
+                Py_DECREF(value);
             }
         }
     }
