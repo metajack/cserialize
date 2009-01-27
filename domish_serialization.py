@@ -7,6 +7,8 @@ import sys
 import time
 
 from twisted.words.xish import domish
+domish.USE_CSERIALIZE = False
+
 from cserialize import serialize
 
 def slowfunc_py(elements, count):
