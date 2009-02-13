@@ -99,7 +99,7 @@ static prefix_t *prefix_find_uri(prefix_t **list, char *uri, int *counter)
     return item;
 }
 
-static int encode(char *val, int size, char *buf, int pos, int len)
+static int encode(char *val, int size, int attr, char *buf, int pos, int len)
 {
     int c;
 
@@ -124,6 +124,14 @@ static int encode(char *val, int size, char *buf, int pos, int len)
             strncpy(&buf[pos], "&gt;", 4);
             pos += 4;
             break;
+        case '\'':
+            if (attr) {
+                if (6 > (len - pos))
+                    return 0;
+                strncpy(&buf[pos], "&apos;", 6);
+                pos += 6;
+                break;
+            }
         default:
             if (1 > (len - pos))
                 return 0;
@@ -259,7 +267,7 @@ static int do_serialize(PyObject *element,
             strcpy(&buf[pos], s);
             pos += size;
         } else {
-            pos = encode(s, size, buf, pos, len);
+            pos = encode(s, size, 0, buf, pos, len);
         }
         Py_DECREF(clsname);
         Py_DECREF(class);
@@ -514,7 +522,7 @@ static int do_serialize(PyObject *element,
         }
         buf[pos++] = '=';
         buf[pos++] = '\'';
-        pos = encode(PyString_AS_STRING(value), valsize, 
+        pos = encode(PyString_AS_STRING(value), valsize, 1,
                      buf, pos, len);
         if (!pos) {
             if (keyname) { Py_DECREF(keyname); }
