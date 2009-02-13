@@ -47,8 +47,8 @@ class SerializeTestCase(unittest.TestCase):
 
     def testEncodedAttr(self):
         elem = domish.Element((None, 'encoded'))
-        elem['a'] = 'one&two<three'
-        e = u"<encoded a='one&amp;two&lt;three'/>"
+        elem['a'] = 'one&two<three\'four'
+        e = u"<encoded a='one&amp;two&lt;three&apos;four'/>"
         s = serialize(elem)
         self.check(e, s)
 
