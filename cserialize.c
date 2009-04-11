@@ -264,6 +264,12 @@ static int do_serialize(PyObject *element,
         class = PyObject_GetAttrString(element, "__class__");
         clsname = PyObject_GetAttrString(class, "__name__");
         if (strcmp("SerializedXML", PyString_AS_STRING(clsname)) == 0) {
+            if (size > len - pos + 1) {
+                Py_DECREF(clsname);
+                Py_DECREF(class);
+                Py_DECREF(o);
+                goto error;
+            }
             strcpy(&buf[pos], s);
             pos += size;
         } else {

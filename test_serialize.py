@@ -213,4 +213,11 @@ class SerializeTestCase(unittest.TestCase):
         s = serialize(elem)
         self.check(e, s)
         
-
+    def testLongSerializedXML(self):
+        data = "<bar>" + ("abc" * 4096) + "</bar>"
+        elem = domish.Element((None, 'foo'))
+        elem.addRawXml(data)
+        e = "<foo>" + data + "</foo>"
+        s = serialize(elem)
+        self.check(e, s)
+        
